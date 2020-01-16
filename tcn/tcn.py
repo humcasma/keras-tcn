@@ -1,10 +1,11 @@
+import math
 from typing import List
 
 from tensorflow.keras import backend as K, Model, Input, optimizers
-from tensorflow.keras import layers
-from tensorflow.keras.layers import Activation, SpatialDropout1D, Lambda
+from tensorflow.keras.layers import Activation, SpatialDropout1D, Lambda, Add
 from tensorflow.keras.layers import Layer, Conv1D, Dense, BatchNormalization, LayerNormalization
 from tensorflow_addons.layers import WeightNormalization
+from tensorflow.keras.models import Sequential
 
 # noinspection PyPackageRequirements
 class ResidualBlock(Layer):
@@ -20,6 +21,7 @@ class ResidualBlock(Layer):
                  kernel_initializer='he_normal',
                  normalization=('weight', 'weight'),
                  last_block=True,
+                 name='ResidualBlock',
                  **kwargs):
 
         # type: (int, int, int, str, str, str, float, str, str, bool, bool, dict) -> None
@@ -40,11 +42,11 @@ class ResidualBlock(Layer):
             kwargs: Any initializers for Layer class.
         """
 
-        assert (type(normalization) is list and
+        assert (type(normalization) is tuple and
                 len(normalization) == 2 and
-                all(n in ['batch', 'layer', 'weight', None] for n in normalization)), "normalization must be a list with two elements, each one with a value in ['batch', 'layer', 'weight', None]"
-        assert (type(conv_activation) is list and
-                len(conv_activation) == 2), "conv_activation must be a list with two elements"
+                all(n in ['batch', 'layer', 'weight', None] for n in normalization)), "normalization must be a tuple with two elements, each one with a value in ['batch', 'layer', 'weight', None]"
+        assert (type(conv_activation) is tuple and
+                len(conv_activation) == 2), "conv_activation must be a tuple with two elements"
 
         self.dilation_rate = dilation_rate
         self.nb_filters = nb_filters
@@ -57,7 +59,7 @@ class ResidualBlock(Layer):
         self.kernel_initializer = kernel_initializer
         self.last_block = last_block
 
-        super(ResidualBlock, self).__init__(**kwargs)
+        super(ResidualBlock, self).__init__(name=name, **kwargs)
 
     def _add_and_activate_layer(self, layer):
         """Helper function for building layer
@@ -68,17 +70,20 @@ class ResidualBlock(Layer):
 
         """
         self.residual_layers.append(layer)
+        if isinstance(layer, type): #WeightNormalization)
+            return
         self.residual_layers[-1].build(self.res_output_shape)
         self.res_output_shape = self.residual_layers[-1].compute_output_shape(self.res_output_shape)
 
     def build(self, input_shape):
+        print("RB: input_shape", input_shape)
 
         with K.name_scope(self.name):  # name scope used to make sure weights get unique names
             self.residual_layers = list()
             self.res_output_shape = input_shape
 
             for k in range(2):
-                name = 'conv1D_{}'.format(k)
+                name = 'rb_conv1D_{}'.format(k)
                 with K.name_scope(name):  # name scope used to make sure weights get unique names
                     self._add_and_activate_layer(Conv1D(filters=self.nb_filters,
                                                         kernel_size=self.kernel_size,
@@ -87,12 +92,13 @@ class ResidualBlock(Layer):
                                                         name=name,
                                                         kernel_initializer=self.kernel_initializer))
 
+                # OBS! WeightNormalization is not pre-built, but directly added in call()
                 if self.normalization[k] == 'batch':
                     self._add_and_activate_layer(BatchNormalization())
                 elif self.normalization[k] == 'layer':
                     self._add_and_activate_layer(LayerNormalization())
                 elif self.normalization[k] == 'weight':
-                    self._add_and_activate_layer(WeightNormalization())
+                    self._add_and_activate_layer(WeightNormalization(self.residual_layers[-1]))
 
                 self._add_and_activate_layer(Activation(self.conv_activation[k]))
                 self._add_and_activate_layer(SpatialDropout1D(rate=self.dropout_rate))
@@ -131,17 +137,36 @@ class ResidualBlock(Layer):
         """
         x = inputs
         for layer in self.residual_layers:
+            if isinstance(layer, WeightNormalization):
+                pass
             if isinstance(layer, SpatialDropout1D):
                 x = layer(x, training=training)
             else:
                 x = layer(x)
+            print("  Residual Block - Shape after {}: {}".format(layer.name, x.shape))
 
         x2 = self.shape_match_conv(inputs)
-        res_x = layers.add([x2, x])
+        res_x = Add()([x2, x])
         return [self.final_activation(res_x), x]
 
     def compute_output_shape(self, input_shape):
         return [self.res_output_shape, self.res_output_shape]
+
+
+    def get_config(self):
+        config = super(ResidualBlock, self).get_config()
+        config['dilation_rate'] = self.dilation_rate
+        config['nb_filters'] = self.nb_filters
+        config['kernel_size'] = self.kernel_size
+        config['padding'] = self.padding
+        config['conv_activation'] = self.conv_activation,
+        config['residual_block_activation'] = self.residual_block_activation,
+        config['dropout_rate'] = self.dropout_rate
+        config['normalization'] = self.normalization
+        config['kernel_initializer'] = self.kernel_initializer
+        config['last_block'] = self.last_block
+
+        return config
 
 
 def process_dilations(dilations):
@@ -163,18 +188,21 @@ class TCN(Layer):
             A tensor of shape (batch_size, timesteps, input_dim).
 
         Args:
-            nb_filters: The number of filters to use in the convolutional layers.
+            input_timesteps: Length of history this TCN should be able to process. If specified, either kernel size or both dilations and nb_residualblocks should not be specified and will be automatically chosen to achieve a receptive field size greater than input_timesteps  
             kernel_size: The size of the kernel to use in each convolutional layer.
-            dilations: The list of the dilations. Example is: [1, 2, 4, 8, 16, 32, 64].
+            nb_residualblocks: If specified, each stack will consist of nb_residualblocks residual blocks and their dilations will increase exponentially, i.e., d_i = 2^(i-1), for i=1, .., nb_residualblocks
+            dilations: The list of dilations for the residual blocks inside one stack. Example is: [1, 2, 4, 8, 16, 32, 64]. Ignored if nb_residualblocks is specified.
             nb_stacks : The number of stacks of residual blocks to use.
+            nb_filters: Number of filters to use in the convolutional layers. If a scalar, use same number of filters in all conv layers. If a list, ensure that len(nb_filters)=nb_residualblocks 
             padding: The padding to use in the convolutional layers, 'causal' or 'same'.
-            use_skip_connections: Boolean. If we want to add skip connections from input to each residual blocK.
+            use_skip_connections: Either None, for no skip connections, 'wavenet', for using skip connections ala Wavenet, or 'rb_output', for using skip connections on the residual blocks' outputs
             return_sequences: Boolean. Whether to return the last output in the output sequence, or the full sequence.
             conv_activation: list of activations to be used for the two dilated convolutions inside the residual blcok
             residual_block_activation: final activation on the output of the residual block, i.e., o = Activation(x + F(x))
             dropout_rate: Float between 0 and 1. Fraction of the input units to drop.
             kernel_initializer: Initializer for the kernel weights matrix (Conv1D).
-            normalization: Whether to use batch, layer, weight or no normalization after the dilated convolutions in the residual block. A list of two elements, which can take values in ['batch', 'layer', 'weight', None]. 
+            normalization: Whether to use batch, layer, weight or no normalization after the dilated convolutions in the residual block. A list of two elements, which can take values in ['batch', 'layer', 'weight', None].
+            use_input_conv: Whether to pass the input data through a conv1D layer with a kernel size of 1
             kwargs: Any other arguments for configuring parent class Layer. For example "name=str", Name of the model.
                     Use unique names when using multiple TCN.
 
@@ -182,32 +210,36 @@ class TCN(Layer):
             A TCN layer.
         """
     def __init__(self,
-                 nb_filters=64,
+                 input_timesteps=None,
                  kernel_size=2,
+                 dilations=None,
+                 nb_residualblocks=4,
                  nb_stacks=1,
-                 dilations=(1, 2, 4, 8, 16, 32),
+                 nb_filters=64,
                  padding='causal',
-                 use_skip_connections=False,
+                 use_skip_connections=None,
                  dropout_rate=0.0,
                  return_sequences=False,
                  conv_activation=('relu', 'relu'),
                  residual_block_activation=None,
                  kernel_initializer='he_normal',
-                 normalization=('weight', 'weight'),
+                 normalization=('layer', 'layer'),
+                 use_input_conv=False,
+                 name='TCN',
                  **kwargs):
-
         self.return_sequences = return_sequences
         self.dropout_rate = dropout_rate
         self.use_skip_connections = use_skip_connections
-        self.dilations = dilations
         self.nb_stacks = nb_stacks
         self.kernel_size = kernel_size
-        self.nb_filters = nb_filters
         self.conv_activation = conv_activation
         self.residual_block_activation = residual_block_activation
         self.padding = padding
         self.kernel_initializer = kernel_initializer
         self.normalization = normalization
+        self.use_input_conv = use_input_conv
+
+        assert use_skip_connections in [None, 'wavenet', 'rb_output'], "Valid values for use_skip_connections are None, 'wavenet' or 'rb_output'"
 
         if padding != 'causal' and padding != 'same':
             raise ValueError("Only 'causal' or 'same' padding are compatible for this layer.")
@@ -220,17 +252,76 @@ class TCN(Layer):
             raise Exception()
 
         # initialize parent class
-        super(TCN, self).__init__(**kwargs)
+        super(TCN, self).__init__(name=name, **kwargs)
+
+        if nb_residualblocks:
+            print("WARNING: both nb_residualblocks and dilations have been specified. The latter will be ignored")
+            self.dilations = [2**i for i in range(nb_residualblocks)]
+        else:
+            if not input_timesteps:
+                assert dilations and type(dilations) in [list, tuple], 'A list of dilations must be specified when nb_residualblocks is None'
+            self.dilations = dilations
+
+
+        if input_timesteps:
+            assert kernel_size or dilations or nb_residualblocks, 'When input_timesteps is specified, either kernel_size or dilations/nb_residualblocks should also be specified'
+            assert (kernel_size and not dilations and not nb_residualblocks) or (not kernel_size and (
+                dilations or nb_residualblocks)), 'When input_timesteps is specified, kernel_size and dilations/nb_residualblocks cannot be both specified'
+
+            if kernel_size:
+                # Need to choose dilations. Using exponentially increasing dilations, we need to choose nb_residualblocks,
+                # such that the receptive field (RF) is greater than input_timesteps
+                # For exponentially increasing dilations, we have RF = B * (1 + 2(k -1)*L) ,
+                # with B = nb_stacks, k = kernel_size and L = nb_residualblocks
+                # (See https://medium.com/the-artificial-impostor/notes-understanding-tensorflow-part-3-7f6633fcc7c7)
+                # We set 5 as the maximum value for L
+                B = 0; L = 6; T = input_timesteps; k = kernel_size
+                while L > 5:
+                    B += 1
+                    L = math.log(1 + (T/B - 1)/(2 * (k -1)), 2)
+                    L = math.ceil(L)
+                self.dilations = [2 ** i for i in range(L)]
+                self.nb_stacks = B
+                nb_residualblocks = L
+            else:
+                # Need to choose kernel_size. We set 10 as maximum kernel size
+                D = sum(self.dilations)
+                B = 0; k = 11; T = input_timesteps
+                while k > 10:
+                    B += 1
+                    k = 1 + (T/B - 1)/(2 * D)
+                    k = math.ceil(k)
+                self.kernel_size = k
+                self.nb_stacks = B
+                nb_residualblocks = len(self.dilations)
+
+            print("TCN parameters:")
+            print(" - nb_stacks: {}".format(self.nb_stacks))
+            print(" - nb_residual_blocks: {}".format(nb_residualblocks))
+            print(" - kernel_size: {}".format(self.kernel_size))
+            print(" - dilations: {}".format(list(self.dilations)))
+            print("")
+            print(" - Nr. of convolutional layers: {}".format(self.nb_stacks * 2 * nb_residualblocks))
+            print(" - Receptive field: {}".format(self.get_receptive_field_size()))
+
+        if type(nb_filters) is int:
+            self.nb_filters = [nb_filters]*nb_residualblocks
+        else:
+            assert len(nb_filters) == nb_residualblocks, 'The length ({}) of the nb_filters list does not match the value of nb_residualblocks ({})'.format(len(nb_filters), nb_residualblocks)
+            self.nb_filters = nb_filters
 
     def build(self, input_shape):
-        self.main_conv1D = Conv1D(filters=self.nb_filters,
+        if self.use_input_conv:
+            self.main_conv1D = Conv1D(filters=self.nb_filters,
                                   kernel_size=1,
                                   padding=self.padding,
                                   kernel_initializer=self.kernel_initializer)
-        self.main_conv1D.build(input_shape)
+            self.main_conv1D.build(input_shape)
 
-        # member to hold current output shape of the layer for building purposes
-        self.build_output_shape = self.main_conv1D.compute_output_shape(input_shape)
+            # member to hold current output shape of the layer for building purposes
+            self.build_output_shape = self.main_conv1D.compute_output_shape(input_shape)
+        else:
+            self.build_output_shape = input_shape
 
         # list to hold all the member ResidualBlocks
         self.residual_blocks = list()
@@ -239,9 +330,9 @@ class TCN(Layer):
             total_num_blocks += 1  # cheap way to do a false case for below
 
         for s in range(self.nb_stacks):
-            for d in self.dilations:
+            for d, nb_filters in zip(self.dilations, self.nb_filters):
                 self.residual_blocks.append(ResidualBlock(dilation_rate=d,
-                                                          nb_filters=self.nb_filters,
+                                                          nb_filters=nb_filters,
                                                           kernel_size=self.kernel_size,
                                                           padding=self.padding,
                                                           conv_activation = self.conv_activation,
@@ -264,6 +355,8 @@ class TCN(Layer):
         self.lambda_layer = Lambda(lambda tt: tt[:, output_slice_index, :])
         self.lambda_ouput_shape = self.lambda_layer.compute_output_shape(self.build_output_shape)
 
+        super().build(input_shape)
+
     def compute_output_shape(self, input_shape):
         """
         Overridden in case keras uses it somewhere... no idea. Just trying to avoid future errors.
@@ -276,26 +369,48 @@ class TCN(Layer):
             return self.build_output_shape
 
     def call(self, inputs, training=None):
+        if self.use_skip_connections == 'wavenet':
+            return self._call_skip_connections_wavenet_style(inputs, training=training)
+        else:
+            return self._call_no_skip_connections_or_rb_output(inputs, training=training)
+
+    def _call_skip_connections_wavenet_style(self, inputs, training=None):
+        '''
+        Use skip connection ala Wavenet, i.e., inside the residual blocks
+        '''
         x = inputs
-        try:
+        if self.use_input_conv:
             x = self.main_conv1D(x)
-        except AttributeError as e:
-            print('The backend of keras-tcn>=2.9.2 changed from keras to tensorflow.keras.')
-            print('Either update your imports:\n- From "from keras.layers import <LayerName>" '
-                  '\n- To "from tensorflow.keras.layers import <LayerName>"')
-            print('Or downgrade to 2.8.3 by running "pip install keras-tcn==2.8.3"')
-            import sys
-            sys.exit(0)
         skip_connections = list()
-        for layer in self.residual_blocks:
-            x, skip_out = layer(x, training=training)
+        for rb in self.residual_blocks:
+            x, skip_out = rb(x, training=training)
+            print("TCN - Shape after Residual Block", x.shape)
             skip_connections.append(skip_out)
 
-        if self.use_skip_connections:
-            x = layers.add(skip_connections)
+        x = Add()(skip_connections)
         if not self.return_sequences:
             x = self.lambda_layer(x)
         return x
+
+    def _call_no_skip_connections_or_rb_output(self, inputs, training=None):
+        '''
+        No skip connections or skip connections on the output of each residual block and use their sum as output, ala Wavenet
+        '''
+        x = inputs
+        if self.use_input_conv:
+            x = self.main_conv1D(x)
+        skip_connections = list()
+        for rb in self.residual_blocks:
+            x, _ = rb(x, training=training)
+            print("TCN - Shape after Residual Block", x.shape)
+            skip_connections.append(x)
+
+        if self.use_skip_connections is 'rb_output':
+            x = Add()(skip_connections)
+        if not self.return_sequences:
+            x = self.lambda_layer(x)
+        return x
+
 
     def get_config(self):
         """
@@ -303,21 +418,29 @@ class TCN(Layer):
         :return: python dictionary with specs to rebuild layer
         """
         config = super(TCN, self).get_config()
-        config['nb_filters'] = self.nb_filters
-        config['kernel_size'] = self.kernel_size
-        config['nb_stacks'] = self.nb_stacks
-        config['dilations'] = self.dilations
-        config['padding'] = self.padding
-        config['use_skip_connections'] = self.use_skip_connections
-        config['dropout_rate'] = self.dropout_rate
         config['return_sequences'] = self.return_sequences
+        config['dropout_rate'] = self.dropout_rate
+        config['use_skip_connections'] = self.use_skip_connections
+        config['nb_stacks'] = self.nb_stacks
+        config['kernel_size'] = self.kernel_size
         config['conv_activation'] = self.conv_activation,
         config['residual_block_activation'] = self.residual_block_activation,
-        config['normalization'] = self.normalization
+        config['padding'] = self.padding
         config['kernel_initializer'] = self.kernel_initializer
+        config['normalization'] = self.normalization
+        config['use_input_conv'] = self.use_input_conv
+        config['dilations'] = self.dilations
+        config['nb_filters'] = self.nb_filters
 
         return config
 
+    def get_receptive_field_size(self):
+        """
+        See https://medium.com/the-artificial-impostor/notes-understanding-tensorflow-part-3-7f6633fcc7c7 
+        https://distill.pub/2019/computing-receptive-fields/
+        and Wavenet paper
+        """
+        return self.nb_stacks * (1 + 2*(self.kernel_size - 1) * sum(self.dilations))
 
 def compiled_tcn(num_feat,  # type: int
                  num_classes,  # type: int
@@ -373,10 +496,12 @@ def compiled_tcn(num_feat,  # type: int
 
     x = TCN(nb_filters, kernel_size, nb_stacks, dilations, padding,
             use_skip_connections, dropout_rate, return_sequences,
-            activation, kernel_initializer, use_batch_norm, use_layer_norm,
-            name=name)(input_layer)
+                 conv_activation=('relu', 'relu'),
+                 residual_block_activation=None,
+                 kernel_initializer=kernel_initializer,
+                 normalization=('batch', 'batch'), name=name)(input_layer)
 
-    print('x.shape=', x.shape)
+    print('tcn.shape=', x.shape)
 
     def get_opt():
         if opt == 'adam':
@@ -415,6 +540,8 @@ def compiled_tcn(num_feat,  # type: int
         model.compile(get_opt(), loss='mean_squared_error')
     print('model.x = {}'.format(input_layer.shape))
     print('model.y = {}'.format(output_layer.shape))
+    model.summary()
+
     return model
 
 
