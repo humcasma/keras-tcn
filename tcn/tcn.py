@@ -70,13 +70,11 @@ class ResidualBlock(Layer):
 
         """
         self.residual_layers.append(layer)
-        if isinstance(layer, type): #WeightNormalization)
-            return
         self.residual_layers[-1].build(self.res_output_shape)
         self.res_output_shape = self.residual_layers[-1].compute_output_shape(self.res_output_shape)
 
     def build(self, input_shape):
-        print("RB: input_shape", input_shape)
+        #print("RB: input_shape", input_shape)
 
         with K.name_scope(self.name):  # name scope used to make sure weights get unique names
             self.residual_layers = list()
@@ -85,20 +83,25 @@ class ResidualBlock(Layer):
             for k in range(2):
                 name = 'rb_conv1D_{}'.format(k)
                 with K.name_scope(name):  # name scope used to make sure weights get unique names
-                    self._add_and_activate_layer(Conv1D(filters=self.nb_filters,
-                                                        kernel_size=self.kernel_size,
-                                                        dilation_rate=self.dilation_rate,
-                                                        padding=self.padding,
-                                                        name=name,
-                                                        kernel_initializer=self.kernel_initializer))
+                    if self.normalization[k] == 'weight':
+                        self._add_and_activate_layer(WeightNormalization(Conv1D(filters=self.nb_filters,
+                                                            kernel_size=self.kernel_size,
+                                                            dilation_rate=self.dilation_rate,
+                                                            padding=self.padding,
+                                                            name=name,
+                                                            kernel_initializer=self.kernel_initializer)))
+                    else:
+                        self._add_and_activate_layer(Conv1D(filters=self.nb_filters,
+                                                            kernel_size=self.kernel_size,
+                                                            dilation_rate=self.dilation_rate,
+                                                            padding=self.padding,
+                                                            name=name,
+                                                            kernel_initializer=self.kernel_initializer))
 
-                # OBS! WeightNormalization is not pre-built, but directly added in call()
                 if self.normalization[k] == 'batch':
                     self._add_and_activate_layer(BatchNormalization())
                 elif self.normalization[k] == 'layer':
                     self._add_and_activate_layer(LayerNormalization())
-                elif self.normalization[k] == 'weight':
-                    self._add_and_activate_layer(WeightNormalization(self.residual_layers[-1]))
 
                 self._add_and_activate_layer(Activation(self.conv_activation[k]))
                 self._add_and_activate_layer(SpatialDropout1D(rate=self.dropout_rate))
@@ -137,13 +140,11 @@ class ResidualBlock(Layer):
         """
         x = inputs
         for layer in self.residual_layers:
-            if isinstance(layer, WeightNormalization):
-                pass
             if isinstance(layer, SpatialDropout1D):
                 x = layer(x, training=training)
             else:
                 x = layer(x)
-            print("  Residual Block - Shape after {}: {}".format(layer.name, x.shape))
+            #print("  Residual Block - Shape after {}: {}".format(layer.name, x.shape))
 
         x2 = self.shape_match_conv(inputs)
         res_x = Add()([x2, x])
@@ -384,7 +385,7 @@ class TCN(Layer):
         skip_connections = list()
         for rb in self.residual_blocks:
             x, skip_out = rb(x, training=training)
-            print("TCN - Shape after Residual Block", x.shape)
+            #print("TCN - Shape after Residual Block", x.shape)
             skip_connections.append(skip_out)
 
         x = Add()(skip_connections)
@@ -402,7 +403,7 @@ class TCN(Layer):
         skip_connections = list()
         for rb in self.residual_blocks:
             x, _ = rb(x, training=training)
-            print("TCN - Shape after Residual Block", x.shape)
+            #print("TCN - Shape after Residual Block", x.shape)
             skip_connections.append(x)
 
         if self.use_skip_connections is 'rb_output':
