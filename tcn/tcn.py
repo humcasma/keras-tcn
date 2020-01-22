@@ -194,7 +194,7 @@ class TCN(Layer):
             nb_residualblocks: If specified, each stack will consist of nb_residualblocks residual blocks and their dilations will increase exponentially, i.e., d_i = 2^(i-1), for i=1, .., nb_residualblocks
             dilations: The list of dilations for the residual blocks inside one stack. Example is: [1, 2, 4, 8, 16, 32, 64]. Ignored if nb_residualblocks is specified.
             nb_stacks : The number of stacks of residual blocks to use.
-            nb_filters: Number of filters to use in the convolutional layers. If a scalar, use same number of filters in all conv layers. If a list, ensure that len(nb_filters)=nb_residualblocks 
+            nb_filters: Number of filters to use in the convolutional layers. If a scalar, use same number of filters in all conv layers. If a list, ensure that len(nb_filters)=nb_residualblocks (+ 1, if use_input_conv=True) 
             padding: The padding to use in the convolutional layers, 'causal' or 'same'.
             use_skip_connections: Either None, for no skip connections, 'wavenet', for using skip connections ala Wavenet, or 'rb_output', for using skip connections on the residual blocks' outputs
             return_sequences: Boolean. Whether to return the last output in the output sequence, or the full sequence.
@@ -305,15 +305,15 @@ class TCN(Layer):
             print(" - Nr. of convolutional layers: {}".format(self.nb_stacks * 2 * nb_residualblocks))
             print(" - Receptive field: {}".format(self.get_receptive_field_size()))
 
-        if type(nb_filters) is int:
+        if isinstance(nb_filters, int):
             self.nb_filters = [nb_filters]*nb_residualblocks
         else:
-            assert len(nb_filters) == nb_residualblocks, 'The length ({}) of the nb_filters list does not match the value of nb_residualblocks ({})'.format(len(nb_filters), nb_residualblocks)
+            assert len(nb_filters) == nb_residualblocks + use_input_conv, 'The length ({}) of the nb_filters list does not match the value of nb_residualblocks ({}), plus 1 if use_input_conv is True'.format(len(nb_filters), nb_residualblocks)
             self.nb_filters = nb_filters
 
     def build(self, input_shape):
         if self.use_input_conv:
-            self.main_conv1D = Conv1D(filters=self.nb_filters,
+            self.main_conv1D = Conv1D(filters=self.nb_filters[0],
                                   kernel_size=1,
                                   padding=self.padding,
                                   kernel_initializer=self.kernel_initializer)
@@ -331,7 +331,7 @@ class TCN(Layer):
             total_num_blocks += 1  # cheap way to do a false case for below
 
         for s in range(self.nb_stacks):
-            for d, nb_filters in zip(self.dilations, self.nb_filters):
+            for d, nb_filters in zip(self.dilations, self.nb_filters[1:]):
                 self.residual_blocks.append(ResidualBlock(dilation_rate=d,
                                                           nb_filters=nb_filters,
                                                           kernel_size=self.kernel_size,

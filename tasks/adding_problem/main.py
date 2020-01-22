@@ -24,7 +24,7 @@ def run_task():
                          dilations=[2 ** i for i in range(9)],
                          nb_stacks=1,
                          max_len=x_train.shape[1],
-                         use_skip_connections=True,
+                         use_skip_connections=False, #True
                          regression=True,
                          dropout_rate=0)
 

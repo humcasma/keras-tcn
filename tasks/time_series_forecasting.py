@@ -33,7 +33,8 @@ print(x.shape)
 print(y.shape)
 
 i = Input(shape=(lookback_window, 1))
-m = TCN()(i)
+m = TCN(return_sequences=False, normalization=('batch', 'batch'))(i)
+print("TCN output", m.shape)
 m = Dense(1, activation='linear')(m)
 
 model = Model(inputs=[i], outputs=[m])
