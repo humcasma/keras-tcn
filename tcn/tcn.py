@@ -329,7 +329,6 @@ class TCN(Layer):
         if not self.use_skip_connections:
             total_num_blocks += 1  # cheap way to do a false case for below
 
-        print('self.nb_stacks', self.nb_stacks, 'self.dilations', self.dilations, 'self.nb_filters[1:]', self.nb_filters[1:])
         for s in range(self.nb_stacks):
             for d, nb_filters in zip(self.dilations, self.nb_filters[1:]):
                 self.residual_blocks.append(ResidualBlock(dilation_rate=d,
