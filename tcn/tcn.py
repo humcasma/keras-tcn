@@ -245,13 +245,6 @@ class TCN(Layer):
         if padding != 'causal' and padding != 'same':
             raise ValueError("Only 'causal' or 'same' padding are compatible for this layer.")
 
-        if not isinstance(nb_filters, int):
-            print('An interface change occurred after the version 2.1.2.')
-            print('Before: tcn.TCN(x, return_sequences=False, ...)')
-            print('Now should be: tcn.TCN(return_sequences=False, ...)(x)')
-            print('The alternative is to downgrade to 2.1.2 (pip install keras-tcn==2.1.2).')
-            raise Exception()
-
         # initialize parent class
         super(TCN, self).__init__(name=name, **kwargs)
 
@@ -284,6 +277,9 @@ class TCN(Layer):
                 self.dilations = [2 ** i for i in range(L)]
                 self.nb_stacks = B
                 nb_residualblocks = L
+                if self.dilations == [1]:
+                    self.dilations.append(2)
+                    nb_residualblocks += 1
             else:
                 # Need to choose kernel_size. We set 10 as maximum kernel size
                 D = sum(self.dilations)
@@ -306,10 +302,13 @@ class TCN(Layer):
             print(" - Receptive field: {}".format(self.get_receptive_field_size()))
 
         if isinstance(nb_filters, int):
-            self.nb_filters = [nb_filters]*nb_residualblocks
+            self.nb_filters = [nb_filters]*(nb_residualblocks + 1)
         else:
             assert len(nb_filters) == nb_residualblocks + use_input_conv, 'The length ({}) of the nb_filters list does not match the value of nb_residualblocks ({}), plus 1 if use_input_conv is True'.format(len(nb_filters), nb_residualblocks)
-            self.nb_filters = nb_filters
+            if not use_input_conv:
+                self.nb_filters = [0] + nb_filters  # The first element will be ignored later on
+            else:
+                self.nb_filters = nb_filters
 
     def build(self, input_shape):
         if self.use_input_conv:
@@ -330,6 +329,7 @@ class TCN(Layer):
         if not self.use_skip_connections:
             total_num_blocks += 1  # cheap way to do a false case for below
 
+        print('self.nb_stacks', self.nb_stacks, 'self.dilations', self.dilations, 'self.nb_filters[1:]', self.nb_filters[1:])
         for s in range(self.nb_stacks):
             for d, nb_filters in zip(self.dilations, self.nb_filters[1:]):
                 self.residual_blocks.append(ResidualBlock(dilation_rate=d,
