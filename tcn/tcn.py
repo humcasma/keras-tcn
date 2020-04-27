@@ -6,6 +6,25 @@ from tensorflow.keras.layers import Activation, SpatialDropout1D, Lambda, Add
 from tensorflow.keras.layers import Layer, Conv1D, Dense, BatchNormalization, LayerNormalization
 from tensorflow_addons.layers import WeightNormalization
 from tensorflow.keras.models import Sequential
+import tensorflow as tf
+
+def leveledinit_initializer(kernel_size, type):
+    def _leveledinit_initializer(shape, dtype=None):
+        # if type == 'conv1_weight':
+        #     w = tf.random.normal(shape, mean=0.0, stddev=1e-3, dtype=dtype)
+        #     w[:, 0, :] += 1.0 / kernel_size # Copied from Pytorch code. This should probably be w[:, :, 0]
+        # elif type == 'conv2_weight':
+        #     w = tf.random.normal(shape, mean=0.0, stddev=1e-3, dtype=dtype)
+        #     w += 1.0 / kernel_size
+        if type == 'weight':
+            w = tf.random.normal(shape, mean=0.0, stddev=1e-3, dtype=dtype)
+            w += 1.0 / kernel_size
+        elif type == 'bias':
+            w = tf.random.normal(shape, mean=0.0, stddev=1e-6, dtype=dtype)
+        elif type == 'shape_match':
+            w = tf.random.normal(shape, mean=0.0, stddev=0.1, dtype=dtype)
+        return w
+    return _leveledinit_initializer
 
 # noinspection PyPackageRequirements
 class ResidualBlock(Layer):
@@ -83,20 +102,29 @@ class ResidualBlock(Layer):
             for k in range(2):
                 name = 'rb_conv1D_{}'.format(k)
                 with K.name_scope(name):  # name scope used to make sure weights get unique names
+                    if self.kernel_initializer == 'leveledinit':
+                        kernel_initializer = leveledinit_initializer(self.kernel_size, 'weight')
+                        bias_initializer = leveledinit_initializer(self.kernel_size, 'bias')
+                    else:
+                        kernel_initializer = self.kernel_initializer
+                        bias_initializer = 'zeros'
+
                     if self.normalization[k] == 'weight':
                         self._add_and_activate_layer(WeightNormalization(Conv1D(filters=self.nb_filters,
                                                             kernel_size=self.kernel_size,
                                                             dilation_rate=self.dilation_rate,
                                                             padding=self.padding,
                                                             name=name,
-                                                            kernel_initializer=self.kernel_initializer)))
+                                                            kernel_initializer=kernel_initializer,
+                                                            bias_initializer=bias_initializer)))
                     else:
                         self._add_and_activate_layer(Conv1D(filters=self.nb_filters,
                                                             kernel_size=self.kernel_size,
                                                             dilation_rate=self.dilation_rate,
                                                             padding=self.padding,
                                                             name=name,
-                                                            kernel_initializer=self.kernel_initializer))
+                                                            kernel_initializer=kernel_initializer,
+                                                            bias_initializer=bias_initializer))
 
                 if self.normalization[k] == 'batch':
                     self._add_and_activate_layer(BatchNormalization())
@@ -110,12 +138,14 @@ class ResidualBlock(Layer):
                 # 1x1 conv to match the shapes (channel dimension).
                 name = 'conv1D_{}'.format(k + 1)
                 with K.name_scope(name):
+                    kernel_initializer = leveledinit_initializer(self.kernel_size,
+                                                                 'weight') if self.kernel_initializer == 'leveledinit' else self.kernel_initializer
                     # make and build this layer separately because it directly uses input_shape
                     self.shape_match_conv = Conv1D(filters=self.nb_filters,
                                                    kernel_size=1,
                                                    padding='same',
                                                    name=name,
-                                                   kernel_initializer=self.kernel_initializer)
+                                                   kernel_initializer=kernel_initializer)
 
             else:
                 self.shape_match_conv = Lambda(lambda x: x, name='identity')
@@ -249,7 +279,8 @@ class TCN(Layer):
         super(TCN, self).__init__(name=name, **kwargs)
 
         if nb_residualblocks:
-            print("WARNING: both nb_residualblocks and dilations have been specified. The latter will be ignored")
+            if dilations:
+                print("WARNING: both nb_residualblocks and dilations have been specified. The latter will be ignored")
             self.dilations = [2**i for i in range(nb_residualblocks)]
         else:
             if not input_timesteps:
